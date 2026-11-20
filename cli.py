@@ -1,7 +1,8 @@
 """CLI-прототип визуализатора графа зависимостей.
 
 Этап 1: конфигурация и валидация параметров.
-Этап 2: получение NuGet V3 .nuspec и вывод прямых зависимостей.
+Этап 2: получение зависимостей NuGet V3.
+Этап 3: построение транзитивного графа итеративным DFS и обнаружение циклов.
 """
 
 from __future__ import annotations
@@ -16,7 +17,7 @@ import urllib.request
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
 PACKAGE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
@@ -29,7 +30,11 @@ WINDOWS_DRIVE_PREFIX_RE = re.compile(r"^[A-Za-z]:")
 NU_GET_PACKAGE_BASE_ADDRESS = "PackageBaseAddress/3.0.0"
 HTTP_TIMEOUT_SECONDS = 20
 MAX_RESPONSE_BYTES = 10 * 1024 * 1024
-USER_AGENT = "dependency-graph-cli/0.2"
+USER_AGENT = "dependency-graph-cli/0.3"
+TEST_PACKAGE_NAME_RE = re.compile(r"^[A-Z]+$")
+NUGET_VERSION_RE = re.compile(
+    r"^(?P<core>\d+(?:\.\d+){1,3})(?:-(?P<pre>[0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$"
+)
 
 
 def is_url(value: str) -> bool:
@@ -65,6 +70,34 @@ class ConfigurationError(ValueError):
 
 class NuGetRepositoryError(RuntimeError):
     """Ошибка получения или разбора данных NuGet-репозитория."""
+
+
+class GraphRepositoryError(RuntimeError):
+    """Ошибка чтения или проверки тестового описания графа."""
+
+
+@dataclass(frozen=True)
+class PackageNode:
+    """Вершина графа; версия отсутствует только в тестовом графе этапа 3."""
+
+    package: str
+    version: str | None = None
+
+    @property
+    def label(self) -> str:
+        return self.package if self.version is None else f"{self.package}@{self.version}"
+
+
+@dataclass
+class DependencyGraph:
+    """Ориентированный граф достижимых зависимостей и найденные циклы."""
+
+    adjacency: dict[PackageNode, list[PackageNode]]
+    cycles: list[tuple[PackageNode, ...]]
+
+    @property
+    def edge_count(self) -> int:
+        return sum(len(neighbors) for neighbors in self.adjacency.values())
 
 
 def non_empty_string(value: str) -> str:
@@ -113,10 +146,11 @@ def output_file(value: str) -> Path:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="depgraph",
-        description="Получение прямых зависимостей NuGet-пакета для визуализатора графа.",
+        description="Построение транзитивного графа зависимостей NuGet-пакета.",
         epilog=(
-            "В режиме test параметр --repository должен указывать на локальный NuGet V3 Service Index. "
-            "В режиме remote требуется URL NuGet V3 Service Index с протоколом http или https."
+            "При --test-repo-mode on параметр --repository должен указывать на JSON-файл графа "
+            "с именами вершин из заглавных латинских букв. При --test-repo-mode off требуется "
+            "URL NuGet V3 Service Index с протоколом http или https."
         ),
     )
     parser.add_argument(
@@ -125,11 +159,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--repository", required=True, type=non_empty_string, metavar="URL_OR_PATH",
-        help="URL NuGet V3 Service Index или путь к его локальной копии для тестирования",
+        help="URL NuGet V3 Service Index или путь к JSON-описанию графа в тестовом режиме",
     )
     parser.add_argument(
         "--test-repo-mode", choices=("on", "off"), default="off", metavar="{on,off}",
-        help="режим локального тестового репозитория: on — файл, off — HTTP(S) URL (по умолчанию: off)",
+        help="режим тестирования: on — локальный JSON-граф, off — удалённый NuGet V3 (по умолчанию: off)",
     )
     parser.add_argument(
         "--version", required=True, type=package_version, metavar="SEMVER",
@@ -372,38 +406,302 @@ def parse_nuspec(
     return dependencies
 
 
-def get_direct_dependencies(config: Configuration) -> list[Dependency]:
-    """Получает зависимости точной версии пакета через NuGet V3 API."""
-    if config.test_repo_mode == "on":
-        service_index_uri = Path(config.repository).resolve().as_uri()
-    else:
-        service_index_uri = config.repository
-
-    base_address = discover_package_base_address(service_index_uri)
-    nuspec_uri = build_nuspec_uri(base_address, config.package, config.version)
+def get_direct_dependencies_from_base_address(
+    base_address: str, package: str, version: str
+) -> list[Dependency]:
+    """Получает зависимости одной точной версии через NuGet flat container."""
+    nuspec_uri = build_nuspec_uri(base_address, package, version)
     nuspec_payload = _read_resource(nuspec_uri)
-    return parse_nuspec(nuspec_payload, config.package, config.version)
+    return parse_nuspec(nuspec_payload, package, version)
 
 
-def print_direct_dependencies(dependencies: list[Dependency]) -> None:
-    """Печатает все найденные прямые зависимости и группы платформ."""
-    print(f"direct_dependencies_count={len(dependencies)}")
-    if not dependencies:
-        print("direct_dependencies=none")
-        return
+def get_direct_dependencies_from_service_index(
+    service_index_uri: str, package: str, version: str
+) -> list[Dependency]:
+    """Получает прямые зависимости из любого NuGet V3 Service Index URI."""
+    base_address = discover_package_base_address(service_index_uri)
+    return get_direct_dependencies_from_base_address(base_address, package, version)
 
-    print("direct_dependencies:")
-    for dependency in dependencies:
-        fields = [
-            f"package={dependency.package}",
-            f"version={dependency.version_range}",
-            f"target_framework={dependency.target_framework or 'any'}",
-        ]
-        if dependency.include:
-            fields.append(f"include={dependency.include}")
-        if dependency.exclude:
-            fields.append(f"exclude={dependency.exclude}")
-        print("- " + " ".join(fields))
+
+def get_direct_dependencies(config: Configuration) -> list[Dependency]:
+    """Получает прямые зависимости из удалённого NuGet-репозитория.
+
+    В режиме тестирования этапа 3 repository является описанием графа, а не
+    NuGet Service Index; поэтому этот helper предназначен для удалённого режима.
+    """
+    if config.test_repo_mode == "on":
+        raise NuGetRepositoryError(
+            "в тестовом режиме этапа 3 --repository является JSON-описанием графа, а не NuGet Service Index"
+        )
+    return get_direct_dependencies_from_service_index(
+        config.repository, config.package, config.version
+    )
+
+
+def read_test_graph(repository_path: str | Path) -> dict[str, list[str]]:
+    """Читает JSON-список смежности; все имена вершин — A..Z без цифр."""
+    path = Path(repository_path)
+    try:
+        payload = path.read_text(encoding="utf-8-sig")
+    except OSError as exc:
+        raise GraphRepositoryError(f"не удалось прочитать файл графа {path}: {exc}") from exc
+    try:
+        document = json.loads(payload)
+    except json.JSONDecodeError as exc:
+        raise GraphRepositoryError(
+            f"файл тестового графа содержит некорректный JSON (строка {exc.lineno}, столбец {exc.colno})"
+        ) from exc
+    if not isinstance(document, dict) or not document:
+        raise GraphRepositoryError("описание графа должно быть непустым JSON-объектом вида {\"A\": [\"B\"]}")
+
+    graph: dict[str, list[str]] = {}
+    for package, dependencies in document.items():
+        if not isinstance(package, str) or not TEST_PACKAGE_NAME_RE.fullmatch(package):
+            raise GraphRepositoryError(
+                f"недопустимое имя пакета {package!r}: используйте только заглавные латинские буквы A-Z"
+            )
+        if not isinstance(dependencies, list):
+            raise GraphRepositoryError(f"список зависимостей пакета {package} должен быть массивом")
+        normalized: list[str] = []
+        for dependency in dependencies:
+            if not isinstance(dependency, str) or not TEST_PACKAGE_NAME_RE.fullmatch(dependency):
+                raise GraphRepositoryError(
+                    f"недопустимое имя зависимости {dependency!r} пакета {package}: "
+                    "используйте только заглавные латинские буквы A-Z"
+                )
+            if dependency not in normalized:
+                normalized.append(dependency)
+        graph[package] = normalized
+
+    declared = set(graph)
+    for package, dependencies in graph.items():
+        for dependency in dependencies:
+            if dependency not in declared:
+                raise GraphRepositoryError(
+                    f"пакет {dependency}, указанный как зависимость {package}, отсутствует в описании графа"
+                )
+    return graph
+
+
+def build_dependency_graph(
+    root: PackageNode,
+    dependency_loader: Callable[[PackageNode], list[PackageNode]],
+) -> DependencyGraph:
+    """Строит достижимую часть графа итеративным DFS с трёхцветной разметкой.
+
+    Белая вершина ещё не посещалась, серая находится в текущем стеке DFS,
+    чёрная полностью обработана. Ребро в серую вершину является обратным
+    ребром и фиксирует цикл. Явный стек кадров исключает рекурсию Python.
+    """
+    adjacency: dict[PackageNode, list[PackageNode]] = {root: []}
+    colors: dict[PackageNode, str] = {root: "gray"}
+    active: list[PackageNode] = [root]
+    active_positions: dict[PackageNode, int] = {root: 0}
+    loaded: set[PackageNode] = set()
+    cycles: list[tuple[PackageNode, ...]] = []
+    # Каждый кадр хранит текущую вершину и индекс следующего ребра.
+    frames: list[tuple[PackageNode, int]] = [(root, 0)]
+
+    while frames:
+        node, next_index = frames[-1]
+        if node not in loaded:
+            neighbors = dependency_loader(node)
+            if not isinstance(neighbors, list):
+                neighbors = list(neighbors)
+            # Удаляем повторяющиеся рёбра, сохраняя порядок из репозитория.
+            unique_neighbors: list[PackageNode] = []
+            seen_neighbors: set[PackageNode] = set()
+            for neighbor in neighbors:
+                if not isinstance(neighbor, PackageNode):
+                    raise TypeError("dependency_loader должен возвращать список PackageNode")
+                if neighbor not in seen_neighbors:
+                    unique_neighbors.append(neighbor)
+                    seen_neighbors.add(neighbor)
+            adjacency[node] = unique_neighbors
+            loaded.add(node)
+
+        neighbors = adjacency[node]
+        if next_index >= len(neighbors):
+            frames.pop()
+            colors[node] = "black"
+            active_positions.pop(node, None)
+            active.pop()
+            continue
+
+        neighbor = neighbors[next_index]
+        frames[-1] = (node, next_index + 1)
+        adjacency.setdefault(neighbor, [])
+        color = colors.get(neighbor, "white")
+
+        if color == "white":
+            colors[neighbor] = "gray"
+            active_positions[neighbor] = len(active)
+            active.append(neighbor)
+            frames.append((neighbor, 0))
+        elif color == "gray":
+            cycle_start = active_positions[neighbor]
+            cycle = tuple(active[cycle_start:] + [neighbor])
+            # Каждое обратное ребро даёт один фундаментальный цикл DFS.
+            cycles.append(cycle)
+        # Чёрная вершина уже обработана; ребро остаётся в adjacency.
+
+    return DependencyGraph(adjacency=adjacency, cycles=cycles)
+
+
+def build_test_dependency_graph(config: Configuration) -> DependencyGraph:
+    """Строит граф из локального JSON-файла в режиме тестирования."""
+    repository_graph = read_test_graph(config.repository)
+    if not TEST_PACKAGE_NAME_RE.fullmatch(config.package):
+        raise GraphRepositoryError(
+            "в тестовом режиме --package должен содержать только заглавные латинские буквы A-Z"
+        )
+    if config.package not in repository_graph:
+        raise GraphRepositoryError(
+            f"пакет {config.package} не найден в тестовом описании графа"
+        )
+
+    def load_neighbors(node: PackageNode) -> list[PackageNode]:
+        return [PackageNode(package) for package in repository_graph[node.package]]
+
+    return build_dependency_graph(PackageNode(config.package), load_neighbors)
+
+
+def _nuget_version_sort_key(version: str) -> tuple[tuple[int, ...], int, tuple[tuple[int, int | str], ...]] | None:
+    """Возвращает ключ сортировки NuGet/SemVer версии без внешних библиотек."""
+    match = NUGET_VERSION_RE.fullmatch(version.strip())
+    if not match:
+        return None
+    core = tuple(int(part) for part in match.group("core").split("."))
+    core = core + (0,) * (4 - len(core))
+    prerelease = match.group("pre")
+    if prerelease is None:
+        return core, 1, tuple()
+    identifiers: list[tuple[int, int | str]] = []
+    for identifier in prerelease.split("."):
+        if not identifier:
+            return None
+        if identifier.isdigit():
+            identifiers.append((0, int(identifier)))
+        else:
+            identifiers.append((1, identifier.casefold()))
+    return core, 0, tuple(identifiers)
+
+
+def _version_satisfies(version: str, version_range: str) -> bool:
+    """Проверяет NuGet version range: exact, interval, open-ended или minimum."""
+    candidate = _nuget_version_sort_key(version)
+    if candidate is None:
+        return False
+    expression = (version_range or "*").strip()
+    if expression in {"", "*"}:
+        return True
+
+    if expression[0:1] in {"[", "("} and expression[-1:] in {"]", ")"
+    }:
+        body = expression[1:-1]
+        if "," not in body:
+            if expression[0] != "[" or expression[-1] != "]":
+                raise NuGetRepositoryError(f"некорректный диапазон версии NuGet: {version_range}")
+            exact = _nuget_version_sort_key(body.strip())
+            if exact is None:
+                raise NuGetRepositoryError(f"некорректная версия в диапазоне NuGet: {version_range}")
+            return candidate == exact
+        lower_text, upper_text = body.split(",", 1)
+        lower_text, upper_text = lower_text.strip(), upper_text.strip()
+        lower_inclusive, upper_inclusive = expression[0] == "[", expression[-1] == "]"
+    else:
+        # Простая версия в .nuspec означает минимальную включительную версию.
+        lower_text, upper_text = expression, ""
+        lower_inclusive, upper_inclusive = True, False
+
+    if lower_text:
+        lower = _nuget_version_sort_key(lower_text)
+        if lower is None:
+            raise NuGetRepositoryError(f"некорректная нижняя граница диапазона: {version_range}")
+        if candidate < lower or (candidate == lower and not lower_inclusive):
+            return False
+    if upper_text:
+        upper = _nuget_version_sort_key(upper_text)
+        if upper is None:
+            raise NuGetRepositoryError(f"некорректная верхняя граница диапазона: {version_range}")
+        if candidate > upper or (candidate == upper and not upper_inclusive):
+            return False
+    return True
+
+
+def resolve_nuget_version(
+    base_address: str,
+    package: str,
+    version_range: str,
+    versions_cache: dict[str, list[str]] | None = None,
+) -> str:
+    """Выбирает максимальную опубликованную версию, удовлетворяющую диапазону."""
+    package_key = package.casefold()
+    if versions_cache is not None and package_key in versions_cache:
+        versions = versions_cache[package_key]
+    else:
+        encoded_package = urllib.parse.quote(package_key, safe=".-_")
+        versions_uri = urllib.parse.urljoin(base_address, f"{encoded_package}/index.json")
+        document = _read_json(versions_uri)
+        raw_versions = document.get("versions")
+        if not isinstance(raw_versions, list) or not all(isinstance(item, str) for item in raw_versions):
+            raise NuGetRepositoryError(f"индекс версий пакета {package} имеет некорректный формат")
+        versions = raw_versions
+        if versions_cache is not None:
+            versions_cache[package_key] = versions
+
+    matching = [version for version in versions if _version_satisfies(version, version_range)]
+    matching = [version for version in matching if _nuget_version_sort_key(version) is not None]
+    if not matching:
+        raise NuGetRepositoryError(
+            f"для зависимости {package} нет опубликованной версии, удовлетворяющей диапазону {version_range or '*'}"
+        )
+    return max(matching, key=lambda item: _nuget_version_sort_key(item))
+
+
+def build_nuget_dependency_graph(config: Configuration) -> DependencyGraph:
+    """Получает транзитивное замыкание NuGet-зависимостей итеративным DFS."""
+    service_index_uri = config.repository
+    base_address = discover_package_base_address(service_index_uri)
+    versions_cache: dict[str, list[str]] = {}
+    direct_cache: dict[tuple[str, str], list[Dependency]] = {}
+
+    def load_neighbors(node: PackageNode) -> list[PackageNode]:
+        package_key = node.package.casefold()
+        version = node.version or ""
+        cache_key = (package_key, version.casefold())
+        if cache_key not in direct_cache:
+            direct_cache[cache_key] = get_direct_dependencies_from_base_address(
+                base_address, node.package, version
+            )
+        resolved: list[PackageNode] = []
+        for dependency in direct_cache[cache_key]:
+            selected_version = resolve_nuget_version(
+                base_address, dependency.package, dependency.version_range, versions_cache
+            )
+            resolved.append(PackageNode(dependency.package.casefold(), selected_version))
+        return resolved
+
+    root = PackageNode(config.package.casefold(), config.version)
+    return build_dependency_graph(root, load_neighbors)
+
+
+def print_dependency_graph(graph: DependencyGraph) -> None:
+    """Печатает список смежности, размеры графа и информацию о циклах."""
+    print(f"graph_nodes_count={len(graph.adjacency)}")
+    print(f"graph_edges_count={graph.edge_count}")
+    print("dependency_graph:")
+    for node, neighbors in graph.adjacency.items():
+        targets = ", ".join(item.label for item in neighbors) if neighbors else "none"
+        print(f"- {node.label} -> {targets}")
+
+    print(f"cycles_count={len(graph.cycles)}")
+    if graph.cycles:
+        print("cycles:")
+        for cycle in graph.cycles:
+            print("- " + " -> ".join(node.label for node in cycle))
+    else:
+        print("cycles=none")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -416,11 +714,14 @@ def main(argv: list[str] | None = None) -> int:
 
     print_configuration(config)
     try:
-        dependencies = get_direct_dependencies(config)
-    except NuGetRepositoryError as exc:
-        parser.error(f"ошибка получения зависимостей NuGet: {exc}")
+        if config.test_repo_mode == "on":
+            graph = build_test_dependency_graph(config)
+        else:
+            graph = build_nuget_dependency_graph(config)
+    except (NuGetRepositoryError, GraphRepositoryError) as exc:
+        parser.error(f"ошибка построения графа зависимостей: {exc}")
 
-    print_direct_dependencies(dependencies)
+    print_dependency_graph(graph)
     return 0
 
 

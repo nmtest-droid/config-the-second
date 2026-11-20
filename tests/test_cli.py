@@ -11,11 +11,18 @@ from pathlib import Path
 from cli import (
     ConfigurationError,
     NuGetRepositoryError,
+    GraphRepositoryError,
+    PackageNode,
+    _version_satisfies,
+    build_dependency_graph,
+    build_nuget_dependency_graph,
+    build_test_dependency_graph,
     build_nuspec_uri,
     build_parser,
     create_configuration,
     discover_package_base_address,
     get_direct_dependencies,
+    get_direct_dependencies_from_service_index,
     is_url,
     main,
     normalize_nuget_version,
@@ -23,10 +30,13 @@ from cli import (
     package_name,
     package_version,
     parse_nuspec,
+    read_test_graph,
+    resolve_nuget_version,
 )
 
 
 FIXTURES = Path(__file__).parent / "fixtures"
+GRAPH_FIXTURES = FIXTURES / "graphs"
 
 
 class QuietHandler(http.server.SimpleHTTPRequestHandler):
@@ -150,6 +160,107 @@ class ParameterValidationTests(unittest.TestCase):
         self.assertEqual(error.exception.code, 2)
 
 
+class DependencyGraphTests(unittest.TestCase):
+    def _config(self, graph_name: str, package: str = "A"):
+        args = build_parser().parse_args(
+            ["--package", package, "--repository", str(GRAPH_FIXTURES / graph_name),
+             "--test-repo-mode", "on", "--version", "1.0.0"]
+        )
+        return create_configuration(args)
+
+    def test_test_graph_rejects_lowercase_package_names(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "graph.json"
+            path.write_text('{"A": ["b"]}', encoding="utf-8")
+            with self.assertRaisesRegex(GraphRepositoryError, "заглавные латинские"):
+                read_test_graph(path)
+
+    def test_test_graph_rejects_undeclared_dependency(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "graph.json"
+            path.write_text('{"A": ["B"]}', encoding="utf-8")
+            with self.assertRaisesRegex(GraphRepositoryError, "отсутствует"):
+                read_test_graph(path)
+
+    def test_test_graph_rejects_missing_root_package(self):
+        with self.assertRaisesRegex(GraphRepositoryError, "не найден"):
+            build_test_dependency_graph(self._config("chain.json", package="Z"))
+
+    def test_test_graph_requires_uppercase_root_package(self):
+        with self.assertRaisesRegex(GraphRepositoryError, "заглавные латинские"):
+            build_test_dependency_graph(self._config("chain.json", package="a"))
+
+    def test_dfs_builds_dependency_chain(self):
+        graph = build_test_dependency_graph(self._config("chain.json"))
+        self.assertEqual([node.label for node in graph.adjacency], ["A", "B", "C"])
+        self.assertEqual(graph.edge_count, 2)
+        self.assertEqual(graph.cycles, [])
+
+    def test_dfs_handles_branching_and_shared_dependency_once(self):
+        graph = build_test_dependency_graph(self._config("branching.json"))
+        self.assertEqual(len(graph.adjacency), 6)  # G не достижим из A
+        self.assertEqual(graph.edge_count, 7)
+        self.assertEqual(graph.adjacency[PackageNode("F")], [])
+        self.assertEqual(graph.cycles, [])
+
+    def test_dfs_detects_cycle_and_continues_other_branches(self):
+        graph = build_test_dependency_graph(self._config("cycle.json"))
+        self.assertEqual(len(graph.adjacency), 4)
+        self.assertEqual(graph.edge_count, 4)
+        self.assertEqual(len(graph.cycles), 1)
+        self.assertEqual([node.label for node in graph.cycles[0]], ["A", "B", "C", "A"])
+        self.assertIn(PackageNode("D"), graph.adjacency)
+
+    def test_dfs_detects_self_loop(self):
+        graph = build_test_dependency_graph(self._config("self-loop.json"))
+        self.assertEqual(len(graph.cycles), 1)
+        self.assertEqual([node.label for node in graph.cycles[0]], ["A", "A"])
+
+    def test_dfs_handles_isolated_root(self):
+        graph = build_test_dependency_graph(self._config("isolated.json"))
+        self.assertEqual(list(graph.adjacency), [PackageNode("A")])
+        self.assertEqual(graph.edge_count, 0)
+
+    def test_dfs_is_iterative_for_deep_graph(self):
+        count = 2500
+        root = PackageNode("P0")
+
+        def load(node):
+            index = int(node.package[1:])
+            return [PackageNode(f"P{index + 1}")] if index + 1 < count else []
+
+        graph = build_dependency_graph(root, load)
+        self.assertEqual(len(graph.adjacency), count)
+        self.assertEqual(graph.edge_count, count - 1)
+
+    def test_main_prints_graph_metrics_and_cycle_information(self):
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            result = main(
+                ["--package", "A", "--repository", str(GRAPH_FIXTURES / "cycle.json"),
+                 "--test-repo-mode", "on", "--version", "1.0.0",
+                 "--output", str(Path(tempfile.gettempdir()) / "depgraph-stage3.svg")]
+            )
+        self.assertEqual(result, 0)
+        rendered = output.getvalue()
+        self.assertIn("graph_nodes_count=4", rendered)
+        self.assertIn("graph_edges_count=4", rendered)
+        self.assertIn("cycles_count=1", rendered)
+        self.assertIn("A -> B -> C -> A", rendered)
+
+    def test_version_range_selection(self):
+        versions = ["1.0.0-beta.1", "1.0.0", "1.5.0", "2.0.0"]
+        self.assertTrue(_version_satisfies("1.5.0", "[1.0.0, 2.0.0)"))
+        self.assertFalse(_version_satisfies("2.0.0", "[1.0.0, 2.0.0)"))
+        self.assertTrue(_version_satisfies("1.5.0", "1.0.0"))
+        self.assertTrue(_version_satisfies("1.5.0", "*"))
+        self.assertEqual(
+            resolve_nuget_version("https://example.test/flat/", "Dep", "[1.0.0, 2.0.0)",
+                                  {"dep": versions}),
+            "1.5.0",
+        )
+
+
 class NuGetMetadataTests(unittest.TestCase):
     def test_build_nuspec_uri_drops_semver_build_metadata(self):
         self.assertEqual(
@@ -196,14 +307,21 @@ class NuGetMetadataTests(unittest.TestCase):
             with self.assertRaisesRegex(NuGetRepositoryError, "PackageBaseAddress"):
                 discover_package_base_address(index.as_uri())
 
-    def test_get_direct_dependencies_from_local_test_repository(self):
-        config = build_parser().parse_args(
-            ["--package", "Demo", "--repository", str(FIXTURES / "repository.json"),
-             "--test-repo-mode", "on", "--version", "1.2.3"]
+    def test_get_direct_dependencies_from_local_nuget_service_index(self):
+        service_index_uri = (FIXTURES / "repository.json").resolve().as_uri()
+        dependencies = get_direct_dependencies_from_service_index(
+            service_index_uri, "Demo", "1.2.3"
         )
-        dependencies = get_direct_dependencies(create_configuration(config))
         self.assertEqual(len(dependencies), 4)
         self.assertEqual(dependencies[0].package, "Newtonsoft.Json")
+
+    def test_direct_nuget_helper_rejects_stage3_test_graph_mode(self):
+        args = build_parser().parse_args(
+            ["--package", "A", "--repository", str(GRAPH_FIXTURES / "chain.json"),
+             "--test-repo-mode", "on", "--version", "1.0.0"]
+        )
+        with self.assertRaisesRegex(NuGetRepositoryError, "JSON-описанием графа"):
+            get_direct_dependencies(create_configuration(args))
 
     def test_get_direct_dependencies_from_http_nuget_v3_repository(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -222,6 +340,57 @@ class NuGetMetadataTests(unittest.TestCase):
                 )
                 dependencies = get_direct_dependencies(create_configuration(args))
                 self.assertEqual(len(dependencies), 4)
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
+
+    def test_build_nuget_dependency_graph_resolves_transitive_versions_and_cycle(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            make_service_index(root)
+
+            def add_nuspec(package, version, dependencies):
+                xml = (
+                    f'<package><metadata><id>{package}</id><version>{version}</version>'
+                    f'<dependencies>{dependencies}</dependencies></metadata></package>'
+                )
+                write_nuspec(root, package, version, xml)
+
+            (root / "packages" / "a").mkdir(parents=True)
+            (root / "packages" / "a" / "index.json").write_text(
+                json.dumps({"versions": ["1.0.0", "1.1.0"]}), encoding="utf-8"
+            )
+            (root / "packages" / "b").mkdir(parents=True)
+            (root / "packages" / "b" / "index.json").write_text(
+                json.dumps({"versions": ["2.0.0"]}), encoding="utf-8"
+            )
+            add_nuspec("Root", "1.0.0", '<dependency id="A" version="[1.0.0, 2.0.0)" />')
+            add_nuspec("A", "1.0.0", "")
+            add_nuspec("A", "1.1.0", '<dependency id="B" version="[2.0.0]" />')
+            add_nuspec("B", "2.0.0", '<dependency id="A" version="[1.0.0, 2.0.0)" />')
+
+            handler = lambda *args, **kwargs: QuietHandler(*args, directory=str(root), **kwargs)
+            server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                service_index_url = f"http://127.0.0.1:{server.server_port}/index.json"
+                args = build_parser().parse_args(
+                    ["--package", "Root", "--repository", service_index_url,
+                     "--test-repo-mode", "off", "--version", "1.0.0"]
+                )
+                graph = build_nuget_dependency_graph(create_configuration(args))
+                self.assertEqual(
+                    {node.label for node in graph.adjacency},
+                    {"root@1.0.0", "a@1.1.0", "b@2.0.0"},
+                )
+                self.assertEqual(graph.edge_count, 3)
+                self.assertEqual(len(graph.cycles), 1)
+                self.assertEqual(
+                    [node.label for node in graph.cycles[0]],
+                    ["a@1.1.0", "b@2.0.0", "a@1.1.0"],
+                )
             finally:
                 server.shutdown()
                 server.server_close()
@@ -248,21 +417,21 @@ class NuGetMetadataTests(unittest.TestCase):
                 server.server_close()
                 thread.join(timeout=2)
 
-    def test_main_prints_all_configuration_and_direct_dependencies(self):
+    def test_main_prints_all_configuration_and_dependency_graph(self):
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
             result = main(
-                ["--package", "Demo", "--repository", str(FIXTURES / "repository.json"),
+                ["--package", "A", "--repository", str(GRAPH_FIXTURES / "chain.json"),
                  "--test-repo-mode", "on", "--version", "1.2.3", "--output",
-                 str(Path(tempfile.gettempdir()) / "depgraph-stage2.svg")]
+                 str(Path(tempfile.gettempdir()) / "depgraph-stage3.svg")]
             )
         self.assertEqual(result, 0)
         rendered = output.getvalue()
         for key in ("package=", "repository=", "test_repo_mode=", "version=", "output="):
             self.assertIn(key, rendered)
-        self.assertIn("direct_dependencies_count=4", rendered)
-        self.assertIn("package=Newtonsoft.Json", rendered)
-        self.assertIn("target_framework=netstandard2.0", rendered)
+        self.assertIn("graph_nodes_count=3", rendered)
+        self.assertIn("A -> B", rendered)
+        self.assertIn("B -> C", rendered)
 
 
 if __name__ == "__main__":
