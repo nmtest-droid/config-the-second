@@ -20,6 +20,18 @@ SEMVER_RE = re.compile(
     r"(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$"
 )
 SUPPORTED_IMAGE_FORMATS = {".png", ".svg"}
+WINDOWS_DRIVE_PREFIX_RE = re.compile(r"^[A-Za-z]:")
+
+
+def is_url(value: str) -> bool:
+    """Определяет URL, не принимая Windows-пути вида C:\\repo.json за URI-схему.
+
+    urllib.parse.urlparse считает букву диска (например, ``C:``) схемой URI.
+    Поэтому перед проверкой схемы отдельно распознаём Windows drive paths.
+    """
+    if WINDOWS_DRIVE_PREFIX_RE.match(value):
+        return False
+    return bool(urlparse(value).scheme)
 
 
 @dataclass(frozen=True)
@@ -131,8 +143,7 @@ def create_configuration(args: argparse.Namespace) -> Configuration:
     repository = args.repository
 
     if args.test_repo_mode == "on":
-        parsed_url = urlparse(repository)
-        if parsed_url.scheme or parsed_url.netloc:
+        if is_url(repository):
             raise ConfigurationError(
                 "при --test-repo-mode on параметр --repository должен быть локальным путём, а не URL"
             )
