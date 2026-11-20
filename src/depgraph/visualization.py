@@ -6,7 +6,7 @@ import json
 import re
 import shutil
 import subprocess
-import xml.etree.ElementTree as ET
+import xml.etree.ElementTree as e_t
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
@@ -157,13 +157,13 @@ def graph_to_d2(graph: DependencyGraph) -> str:
 
 
 def _svg_element(
-    parent: ET.Element,
+    parent: e_t.Element,
     tag: str,
     attributes: dict[str, str] | None = None,
     text: str | None = None,
-) -> ET.Element:
+) -> e_t.Element:
     """Append an SVG element to its parent and return the new element."""
-    element = ET.SubElement(
+    element = e_t.SubElement(
         parent,
         f"{{{SVG_NAMESPACE}}}{tag}",
         attributes or {},
@@ -291,7 +291,7 @@ def _calculate_layout(graph: DependencyGraph) -> SvgLayout:
     )
 
 
-def _add_svg_markers(root: ET.Element) -> None:
+def _add_svg_markers(root: e_t.Element) -> None:
     """Create the standard and cycle arrow markers for SVG edges."""
     definitions = _svg_element(root, "defs")
     markers = (
@@ -320,7 +320,7 @@ def _add_svg_markers(root: ET.Element) -> None:
 
 
 def _add_svg_title(
-    root: ET.Element,
+    root: e_t.Element,
     graph: DependencyGraph,
     layout: SvgLayout,
 ) -> None:
@@ -354,7 +354,7 @@ def _add_svg_title(
 
 
 def _add_svg_accessibility(
-    root: ET.Element,
+    root: e_t.Element,
     graph: DependencyGraph,
 ) -> None:
     """Add accessible title and description elements to the SVG."""
@@ -373,7 +373,7 @@ def _add_svg_accessibility(
     )
 
 
-def _add_svg_background(root: ET.Element, layout: SvgLayout) -> None:
+def _add_svg_background(root: e_t.Element, layout: SvgLayout) -> None:
     """Add a white background rectangle matching the SVG canvas size."""
     _svg_element(
         root,
@@ -391,9 +391,9 @@ def _add_svg_background(root: ET.Element, layout: SvgLayout) -> None:
 def _create_svg_root(
     graph: DependencyGraph,
     layout: SvgLayout,
-) -> ET.Element:
+) -> e_t.Element:
     """Create the SVG root, accessibility labels and common definitions."""
-    ET.register_namespace("", SVG_NAMESPACE)
+    e_t.register_namespace("", SVG_NAMESPACE)
     dimensions = {
         "width": str(layout.width),
         "height": str(layout.height),
@@ -402,7 +402,7 @@ def _create_svg_root(
         "aria-labelledby": "diagram-title diagram-desc",
         "version": "1.1",
     }
-    root = ET.Element(f"{{{SVG_NAMESPACE}}}svg", dimensions)
+    root = e_t.Element(f"{{{SVG_NAMESPACE}}}svg", dimensions)
     _add_svg_accessibility(root, graph)
     _add_svg_markers(root)
     _add_svg_background(root, layout)
@@ -475,7 +475,7 @@ def _forward_edge_path(
 
 
 def _draw_svg_edges(
-    root: ET.Element,
+    root: e_t.Element,
     graph: DependencyGraph,
     layout: SvgLayout,
     cycle_edges: set[tuple[PackageNode, PackageNode]],
@@ -518,7 +518,7 @@ def _node_style(
 
 
 def _draw_svg_node(
-    group: ET.Element,
+    group: e_t.Element,
     node: PackageNode,
     root: PackageNode,
     layout: SvgLayout,
@@ -542,7 +542,7 @@ def _draw_svg_node(
 
 
 def _draw_node_label(
-    group: ET.Element,
+    group: e_t.Element,
     node: PackageNode,
     root: PackageNode,
     x: float,
@@ -574,7 +574,7 @@ def _draw_node_label(
 
 
 def _draw_svg_nodes(
-    root_element: ET.Element,
+    root_element: e_t.Element,
     graph: DependencyGraph,
     layout: SvgLayout,
     cycle_nodes: set[PackageNode],
@@ -599,7 +599,7 @@ def render_svg_builtin(graph: DependencyGraph, svg_file: str | Path) -> None:
     _draw_svg_nodes(root, graph, layout, cycle_nodes)
     output_path = Path(svg_file)
     try:
-        payload = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+        payload = e_t.tostring(root, encoding="utf-8", xml_declaration=True)
         output_path.write_bytes(payload)
     except OSError as exc:
         raise GraphVisualizationError(

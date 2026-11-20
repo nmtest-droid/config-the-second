@@ -9,7 +9,7 @@ import sys
 import tempfile
 import threading
 import unittest
-import xml.etree.ElementTree as ET
+import xml.etree.ElementTree as e_t
 from pathlib import Path
 
 SOURCE_ROOT = Path(__file__).resolve().parents[1] / "src"
@@ -331,7 +331,7 @@ class DependencyGraphTests(unittest.TestCase):
     def test_dfs_handles_branching_and_shared_dependency_once(self):
         """Test that dfs handles branching and shared dependency once."""
         graph = build_test_dependency_graph(self._config("branching.json"))
-        self.assertEqual(len(graph.adjacency), 6)
+        self.assertEqual(len(graph.adjacency), 6)  # G не достижим из A
         self.assertEqual(graph.edge_count, 7)
         self.assertEqual(graph.adjacency[PackageNode("F")], [])
         self.assertEqual(graph.cycles, [])
@@ -754,7 +754,7 @@ class VisualizationTests(unittest.TestCase):
             self.assertEqual(result.svg_file.suffix, ".svg")
             self.assertIn("builtin-svg-fallback", result.renderer)
 
-            root = ET.parse(result.svg_file).getroot()
+            root = e_t.parse(result.svg_file).getroot()
             self.assertTrue(root.tag.endswith("svg"))
             namespace = {"svg": "http://www.w3.org/2000/svg"}
             node_rectangles = root.findall('.//svg:rect[@rx="10"]', namespace)
@@ -769,7 +769,7 @@ class VisualizationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             output = Path(temp_dir) / "cycle.svg"
             render_dependency_graph(graph, output, d2_executable="")
-            tree = ET.parse(output)
+            tree = e_t.parse(output)
             namespace = {"svg": "http://www.w3.org/2000/svg"}
             cycle_query = './/svg:path[@stroke="#DC2626"]'
             cycle_paths = tree.findall(cycle_query, namespace)

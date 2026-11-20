@@ -7,7 +7,7 @@ import re
 import urllib.error
 import urllib.parse
 import urllib.request
-import xml.etree.ElementTree as ET
+import xml.etree.ElementTree as e_t
 from dataclasses import dataclass
 from typing import Any
 
@@ -163,7 +163,7 @@ def _local_name(tag: str) -> str:
     return tag.rsplit("}", 1)[-1] if "}" in tag else tag
 
 
-def _child_text(parent: ET.Element, child_name: str) -> str | None:
+def _child_text(parent: e_t.Element, child_name: str) -> str | None:
     """Return trimmed text of the first matching XML child."""
     for child in parent:
         if _local_name(child.tag) == child_name:
@@ -172,7 +172,7 @@ def _child_text(parent: ET.Element, child_name: str) -> str | None:
 
 
 def _parse_dependency(
-    element: ET.Element,
+    element: e_t.Element,
     target_framework: str | None,
 ) -> Dependency:
     """Convert one nuspec dependency element into a domain model."""
@@ -193,7 +193,7 @@ def _parse_dependency(
     )
 
 
-def _metadata_element(root: ET.Element) -> ET.Element:
+def _metadata_element(root: e_t.Element) -> e_t.Element:
     """Return the metadata element from a nuspec package document."""
     metadata = next(
         (child for child in root if _local_name(child.tag) == "metadata"),
@@ -205,7 +205,7 @@ def _metadata_element(root: ET.Element) -> ET.Element:
 
 
 def _validate_nuspec_identity(
-    metadata: ET.Element,
+    metadata: e_t.Element,
     expected_package: str,
     expected_version: str,
 ) -> None:
@@ -232,7 +232,7 @@ def _validate_nuspec_identity(
 
 
 def _iter_dependency_elements(
-    dependencies_element: ET.Element,
+    dependencies_element: e_t.Element,
 ) -> Any:
     """Yield dependency XML elements paired with their target frameworks."""
     for child in dependencies_element:
@@ -266,8 +266,8 @@ def parse_nuspec(
 ) -> list[Dependency]:
     """Extract direct dependencies from a NuGet nuspec XML document."""
     try:
-        root = ET.fromstring(nuspec_payload)
-    except ET.ParseError as exc:
+        root = e_t.fromstring(nuspec_payload)
+    except e_t.ParseError as exc:
         raise NuGetRepositoryError(
             "получен некорректный XML-файл .nuspec"
         ) from exc
