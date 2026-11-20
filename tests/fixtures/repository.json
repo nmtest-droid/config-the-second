@@ -1,7 +1,10 @@
 {
-  "repository": "demo-test-repository",
-  "packages": [
-    {"name": "demo-package", "version": "1.2.3"},
-    {"name": "demo-core", "version": "2.0.0"}
+  "version": "3.0.0",
+  "resources": [
+    {
+      "@id": "packages/",
+      "@type": "PackageBaseAddress/3.0.0",
+      "comment": "Локальный NuGet V3 flat container для автоматических тестов"
+    }
   ]
 }
