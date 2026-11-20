@@ -1,0 +1,7 @@
+{
+  "repository": "demo-test-repository",
+  "packages": [
+    {"name": "demo-package", "version": "1.2.3"},
+    {"name": "demo-core", "version": "2.0.0"}
+  ]
+}
