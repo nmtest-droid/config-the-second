@@ -33,8 +33,6 @@
 │   │   ├── graphs/
 │   │   └── packages/
 │   └── test_cli.py
-├── examples/
-│   └── README.md
 ├── .gitignore
 ├── Makefile
 ├── run.bat
