@@ -331,7 +331,7 @@ class DependencyGraphTests(unittest.TestCase):
     def test_dfs_handles_branching_and_shared_dependency_once(self):
         """Test that dfs handles branching and shared dependency once."""
         graph = build_test_dependency_graph(self._config("branching.json"))
-        self.assertEqual(len(graph.adjacency), 6)  # G не достижим из A
+        self.assertEqual(len(graph.adjacency), 6)
         self.assertEqual(graph.edge_count, 7)
         self.assertEqual(graph.adjacency[PackageNode("F")], [])
         self.assertEqual(graph.cycles, [])
